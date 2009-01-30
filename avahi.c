@@ -13,13 +13,12 @@
 #include <avahi-common/malloc.h>
 #include <avahi-common/error.h>
 #include <avahi-common/timeval.h>
-#include <thread-watch.h>
 
 static AvahiClient *client = NULL;
-static AvahiThreadedPoll *threaded_poll = NULL;
-
+static AvahiSimplePoll *simple_poll = NULL;
 
 static void resolve_callback(
+
     AvahiServiceResolver *r,
     AVAHI_GCC_UNUSED AvahiIfIndex interface,
     AVAHI_GCC_UNUSED AvahiProtocol protocol,
@@ -44,12 +43,12 @@ static void resolve_callback(
         case AVAHI_RESOLVER_FOUND: {
             char a[AVAHI_ADDRESS_STR_MAX], *t;
 
-            //fprintf(stderr, "Service '%s' of type '%s' in domain '%s':\n", name, type, domain);
+            php_printf("Service '%s' of type '%s' in domain '%s':\n", name, type, domain);
 
             avahi_address_snprint(a, sizeof(a), address);
             t = avahi_string_list_to_string(txt);
-	    /*
-            fprintf(stderr,
+	    
+            php_printf(
                     "\t%s:%u (%s)\n"
                     "\tTXT=%s\n"
                     "\tcookie is %u\n"
@@ -66,7 +65,7 @@ static void resolve_callback(
                     !!(flags & AVAHI_LOOKUP_RESULT_WIDE_AREA),
                     !!(flags & AVAHI_LOOKUP_RESULT_MULTICAST),
                     !!(flags & AVAHI_LOOKUP_RESULT_CACHED));
-	     */
+	    
             avahi_free(t);
         }
     }
@@ -75,7 +74,8 @@ static void resolve_callback(
 }
 
 
-static void browse_callback(
+static int browse_callback(
+
     AvahiServiceBrowser *b,
     AvahiIfIndex interface,
     AvahiProtocol protocol,
@@ -85,31 +85,35 @@ static void browse_callback(
     const char *domain,
     AVAHI_GCC_UNUSED AvahiLookupResultFlags flags,
     void* userdata) {
-
     AvahiClient *c = userdata;
     assert(b);
 
     switch (event) {
         case AVAHI_BROWSER_FAILURE:
-            //fprintf(stderr, "(Browser) %s\n", avahi_strerror(avahi_client_errno(avahi_service_browser_get_client(b))));
-            avahi_threaded_poll_quit(threaded_poll);
+            php_printf("(Browser) %s\n", avahi_strerror(avahi_client_errno(avahi_service_browser_get_client(b))));
+            avahi_simple_poll_quit(simple_poll);
             return;
 
         case AVAHI_BROWSER_NEW:
-            fprintf(stderr, "(Browser) NEW: service '%s' of type '%s' in domain '%s'\n", name, type, domain);
+	    php_printf("%s %s %s" , name,type,domain);
 
-            if (!(avahi_service_resolver_new(c, interface, protocol, name, type, domain, AVAHI_PROTO_UNSPEC, 0, resolve_callback, c)))
-                //fprintf(stderr, "Failed to resolve service '%s': %s\n", name, avahi_strerror(avahi_client_errno(c)));
+            if (!(avahi_service_resolver_new(c, interface, protocol, name, type, domain, AVAHI_PROTO_UNSPEC, 0, resolve_callback, c))) {
+                php_printf("Failed to resolve service '%s': %s\n", name, avahi_strerror(avahi_client_errno(c)));
+	    }
 
             break;
 
         case AVAHI_BROWSER_REMOVE:
-            //fprintf(stderr, "(Browser) REMOVE: service '%s' of type '%s' in domain '%s'\n", name, type, domain);
+            php_printf("(Browser) REMOVE: service '%s' of type '%s' in domain '%s'\n", name, type, domain);
             break;
 
         case AVAHI_BROWSER_ALL_FOR_NOW:
         case AVAHI_BROWSER_CACHE_EXHAUSTED:
-            //fprintf(stderr, "(Browser) %s\n", event == AVAHI_BROWSER_CACHE_EXHAUSTED ? "CACHE_EXHAUSTED" : "ALL_FOR_NOW");
+            php_printf("(Browser) %s\n", event == AVAHI_BROWSER_CACHE_EXHAUSTED ? "CACHE_EXHAUSTED" : "ALL_FOR_NOW");
+	    avahi_simple_poll_quit(simple_poll);
+
+
+	    return 3;
             break;
     }
 }
@@ -120,44 +124,17 @@ static void client_callback(AvahiClient *c, AvahiClientState state, AVAHI_GCC_UN
 
     if (state == AVAHI_CLIENT_FAILURE) {
         php_printf("Server connection failure: %s\n", avahi_strerror(avahi_client_errno(c)));
-        avahi_threaded_poll_quit(threaded_poll);
+        avahi_simple_poll_quit(simple_poll);
     }
 }
 
 PHP_MINIT_FUNCTION(avahi)
 {
-/*	
-	int error;
-
-	if (!(threaded_poll = avahi_threaded_poll_new())) {
-     		return;
-   	}
-
-		
-        //fprintf(stderr, "Failed to create service browser: %s\n", avahi_strerror(avahi_client_errno(client)));
-	
-
-	if (!(client = avahi_client_new(avahi_threaded_poll_get(threaded_poll), 0, client_callback, NULL, &error))) {
-     		fprintf(stderr, "Failed to create client: %s\n", avahi_strerror(error));
-		return;
-   	}
-
-   	if (avahi_threaded_poll_start(threaded_poll) < 0) {
-    	        fprint(stderr,"Failed to start poll");	
-		return;
-   	}
-*/	
-
-        return SUCCESS;
+	return SUCCESS;
 }
 
 PHP_MSHUTDOWN_FUNCTION(avahi)
 {
-
-  	avahi_threaded_poll_stop(threaded_poll);
-  	avahi_client_free(client);
-	avahi_threaded_poll_free(threaded_poll);
-
         return SUCCESS;
 }
 
@@ -182,84 +159,96 @@ PHP_MINFO_FUNCTION(avahi)
 
 PHP_FUNCTION(avahi_remove_service)
 {
-	/*
-        avahi_thread_poll_lock(threaded_poll);
-        avahi_thread_poll_unlock(threaded_poll);
-	*/
 }
 
 PHP_FUNCTION(avahi_create_service)
 {
+    AvahiClient *client = NULL;
+    int error;
+    int ret = 1;
+    struct timeval tv;
+    char *name;
+    int name_len;
 
-	
-	char *name;
-	int name_len;
+    if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s", &name, &name_len) == FAILURE) {
+       	RETURN_NULL();
+    }
 
-    	if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s", &name, &name_len) == FAILURE) {
-        	RETURN_NULL();
-    	}
+    /* Allocate main loop object */
+    if (!(simple_poll = avahi_simple_poll_new())) {
+        php_printf("Failed to create simple poll object.\n");
+	return;    
+    }
 
+    name = avahi_strdup(name);
 
-        int error;
+    /* Allocate a new client */
+    client = avahi_client_new(avahi_simple_poll_get(simple_poll), 0, client_callback, NULL, &error);
 
-        if (!(threaded_poll = avahi_threaded_poll_new())) {
-                return;
-        }
+    /* Check wether creating the client object succeeded */
+    if (!client) {
+       php_printf(stderr, "Failed to create client: %s\n", avahi_strerror(error));
+       return;
+    }
 
-
-                if (!(client = avahi_client_new(avahi_threaded_poll_get(threaded_poll), 0, client_callback, NULL, &error))) {
-                                php_printf("Failed to create client: %s\n", avahi_strerror(error));
-                                return;
-                 }
-                if (avahi_threaded_poll_start(threaded_poll) < 0) {
-                                php_printf("Failed to start poll");
-                                return;
-                }
-
-	if (!threaded_poll) {
-		php_printf("No thread!");
-	}
-	
-	avahi_thread_poll_lock(threaded_poll);
-	//avahi_strdup(name);
-        //avahi_thread_poll_unlock(threaded_poll);
-
-  	php_printf("Hello %s ", name);
+    /* Run the main loop */
+    avahi_simple_poll_loop(simple_poll);
+    
+    php_printf("Hello %s ", name);
 	
 	
 }
 
 PHP_FUNCTION(avahi_browse_service)
 {
-	
-	avahi_thread_poll_lock(threaded_poll);
-	array_init(return_value);
+    AvahiClient *client = NULL;
+    AvahiServiceBrowser *sb = NULL;
+    int error;
+    int ret = 1;
 
-        if (!avahi_service_browser_new(client, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC, "_http._tcp", NULL, 0, browse_callback, client)) {
-                return;
-        }
+    zval *mysubarray;
+    array_init(return_value);
 
-   	avahi_thread_poll_unlock(threaded_poll);
+    ALLOC_INIT_ZVAL(mysubarray);
+    array_init(mysubarray);
+    add_next_index_string(mysubarray, "hello", 1);
+
+
+    /* Allocate main loop object */
+    if (!(simple_poll = avahi_simple_poll_new())) {
+        php_printf("Failed to create simple poll object.\n");
+	return;	    
+    }
+
+    /* Allocate a new client */
+    client = avahi_client_new(avahi_simple_poll_get(simple_poll), 0, client_callback, NULL, &error);
+
+    /* Check wether creating the client object succeeded */
+    if (!client) {
+        php_printf("Failed to create client: %s\n", avahi_strerror(error));
+	return;    
+    }
+
+    /* Create the service browser */
+    if (!(sb = avahi_service_browser_new(client, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC, "_http._tcp", NULL, 0, browse_callback, client))) {
+        php_printf("Failed to create service browser: %s\n", avahi_strerror(avahi_client_errno(client)));
+        return;
+    }
+
+    /* Run the main loop */
+    avahi_simple_poll_loop(simple_poll);
 
 }
 
-PHP_FUNCTION(avahi_browse_all_services)
+PHP_FUNCTION(avahi_browse_array)
 {
-	/*
-        avahi_thread_poll_lock(threaded_poll);
-        array_init(return_value);
-        avahi_thread_poll_unlock(threaded_poll);
-	*/
 }
-
-
-
 
 static function_entry php_avahi_functions[] = {
 	PHP_FE(avahi_create_service, NULL)
 	PHP_FE(avahi_remove_service, NULL)
 	PHP_FE(avahi_browse_service, NULL)
-        PHP_FE(avahi_browse_all_services, NULL)
+        PHP_FE(avahi_browse_array, NULL)
         { NULL, NULL, NULL }
 };
 
